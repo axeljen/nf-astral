@@ -1,0 +1,4 @@
+sample,mask
+sampleA,/path/to/sampleA.callable.bed
+sampleB,/path/to/sampleB.callable.bed
+sampleC,/path/to/sampleC.callable.bed

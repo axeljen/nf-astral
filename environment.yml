@@ -1,0 +1,14 @@
+name: nf-species-tree
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - bedtools=2.31
+  - samtools=1.19
+  - bcftools=1.19
+  - htslib=1.19
+  - angsd=0.940
+  - iqtree=2.2.*
+  - newick_utils=1.6
+  - astral-tree=5.7.*
+  - python=3.11
