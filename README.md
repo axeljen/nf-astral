@@ -1,43 +1,49 @@
-# nf-species_tree
+# nf-astral
 
-A Nextflow (DSL2) pipeline that builds a species tree from window-sampled
-consensus sequences derived from BAM files, CRAM files, or a multi-sample SNP
-VCF. Every mode requires a samplesheet with per-sample callable masks and a
-reference genome.
+A Nextflow pipeline that builds a genome-wide, multi-species coalescent based phylogeny directly from mapped bam/cram files or a vcf file with filtered snps, together with sample-specific mappability masks. 
+
+## Get started
+
+Requirements:
+- [Nextflow](https://www.nextflow.io/)
+- [Singularity/apptainer](https://apptainer.org/)
+
+With these software requirements installed, you can run the pipeline as described below:
+
+```bash
+# clone repository
+git clone https://github.com/axeljen/nf-astral.git
+cd nf-astral
+```
+
+Prepare a sample sheet with two columns, sample and mask file (see `assets/samplesheet.csv`) for an example.
+
+To run with a vcf file as source:
+
+```bash
+nextflow run main.nf \
+   --vcf snps.vcf.gz \
+   --samplesheet assets/samplesheet.csv \
+   --reference reference.fasta
+```
+
+To run with BAM/CRAM files as source:
+
+```bash
+nextflow run main.nf \
+   --bamfiles list/of/bamfiles.txt \
+   --samplesheet assets/samplesheet.csv \
+   --reference reference.fasta
+```
 
 ## Workflow
-
-```mermaid
-flowchart TD
-    A[reference.fasta] --> B[index reference]
-    C[vcf.gz] --> D[index vcf]
-    B --> E[make windows: window_size apart window_step]
-    D --> I[bcftools consensus per sample]
-    B --> I
-    Q[CRAM list] --> R[match SM tags to samplesheet]
-    R --> S[CRAM2BAM using reference]
-    B --> S
-    T[BAM list] --> U[match SM tags to samplesheet]
-    S --> V[ANGSD_CONSENSUS: angsd -doFasta, samtools faidx]
-    U --> V
-    F[per-sample callable mask bed] --> G[complement -> non-callable bed]
-    G --> H[MASK_GENOME: hardmask consensus]
-    I --> H
-    V --> H
-    E --> J[slice window from each sample consensus]
-    H --> J
-    J --> K[concatenate samples per window -> pseudo-alignment]
-    K --> L[filter site/sample missingness]
-    L --> M[IQ-TREE gene tree + ultrafast bootstrap]
-    M --> N[nw_ed: collapse low-support branches]
-    N --> O[combine gene trees]
-    O --> P[ASTRAL species tree]
-```
 
 1. **Windows**: `bedtools makewindows` tiles the genome in `window_step`-sized
    bins and each bin is truncated to `window_size`, giving windows of
    `window_size` bp spaced `window_step` bp apart (defaults: 10 kb windows,
    200 kb apart) to reduce linkage between loci used for gene trees.
+   Windows shorter than `--min_length` are excluded from the generated BED,
+   before any per-window tasks are submitted.
 2. **Per-sample consensus** (computed once per sample, not once per window,
    for efficiency):
    - **CRAM**: `CRAM2BAM` decodes each CRAM with the supplied reference,
@@ -61,7 +67,8 @@ flowchart TD
    from the raw reference (`--include_reference`). Because all sequences are
    derived from the same reference coordinates via substitution only (no
    indels), concatenating them per window already yields a positionally
-   aligned pseudo-alignment.
+   aligned pseudo-alignment. Extraction, optional reference inclusion, and
+   missingness filtering run in a single `EXTRACT_WINDOW_SEQ` task per window.
 4. **Missingness filtering**: a small bundled script (`bin/filter_alignment.py`)
    drops alignment columns exceeding `--max_site_missing`, then drops
    sequences exceeding `--max_sample_missing` (computed after site
@@ -74,7 +81,8 @@ flowchart TD
    bootstrap replicates) builds a tree per window.
 6. **Branch collapsing**: `nw_ed '<tree> "i & b<=<min_support>" o'` (Newick
    Utilities) collapses internal branches with support at or below
-   `min_support` (default 20%) into polytomies.
+   `min_support` (default 20%) into polytomies. Tree inference and collapsing
+   run in a single `IQTREE` task per retained window.
 7. **Species tree**: all collapsed gene trees are concatenated and passed to
    [ASTRAL](https://github.com/smirarab/ASTRAL) to infer the species tree.
 
@@ -88,9 +96,11 @@ nextflow run main.nf \
     --outdir results
 ```
 
-For alignment input, replace `--vcf samples.vcf.gz` with either
-`--bamlist bams.txt` or `--cramlist crams.txt`. Supply **exactly one** of
-these three options, always with `--samplesheet` and `--reference`.
+For alignment input, replace `--vcf samples.vcf.gz` with
+`--bamfiles alignments.txt`. The list may contain BAM and CRAM paths in any
+combination; CRAM files are converted to BAM before consensus generation.
+Supply **exactly one** of these two options, always with `--samplesheet` and
+`--reference`.
 
 Each list contains one file path per line, for example:
 
@@ -99,9 +109,9 @@ Each list contains one file path per line, for example:
 /path/to/sampleB.bam
 ```
 
-Use `.cram` paths for a CRAM list. Blank lines and lines beginning with `#`
-are ignored. Relative paths in lists and samplesheets are resolved from the
-directory where Nextflow is launched. Alignments must be coordinate-sorted;
+Each path must end in `.bam` or `.cram`. Blank lines and lines beginning with
+`#` are ignored. Relative paths in lists and samplesheets are resolved from
+the directory where Nextflow is launched. Alignments must be coordinate-sorted;
 the reference must match the one used to create the alignments, especially
 for CRAM decoding.
 
@@ -117,16 +127,8 @@ sampleB,/path/to/sampleB.callable.bed
 ```
 
 `sample` must match a VCF sample name or the `SM` tag in the BAM/CRAM `@RG`
-header records, **not the alignment filename**. Samplesheet names must be
-unique and contain only letters, digits, underscores, dots, and hyphens
-(starting with a letter, digit, or underscore).
-
-Every alignment must contain exactly one unique, non-empty `SM` sample name;
-multiple read groups for that same sample are allowed. Provide one alignment
-per sample, with exactly the same sample set as the samplesheet. Duplicate
-alignment paths or sample identities, missing `SM` tags, and mismatches fail
-the run. VCF input may contain additional samples; only the samplesheet's
-samples are used, and every requested sample must exist in the VCF.
+header records. Every alignment file must contain exactly one unique, non-empty `SM` sample name;
+multiple read groups for that same sample are allowed. 
 
 `mask` is a BED file of trusted regions (positive/callable mask), required
 and applied in **all** input modes. All branches converge on the same masking,
@@ -145,74 +147,36 @@ window extraction, alignment filtering, and tree construction.
 | `--max_site_missing`     | `0.5`     | Max fraction missing per alignment column                  |
 | `--max_sample_missing`   | `0.5`     | Max fraction missing per sequence (after site filtering)   |
 | `--min_samples`          | `4`       | Minimum sequences required to keep/tree a window            |
-| `--iqtree_model`         | `GTR+G`   | Substitution model passed to IQ-TREE                        |
-| `--bootstrap`            | `1000`    | Ultrafast bootstrap replicates (`iqtree -bb`)               |
+| `--iqtree_model`         | `MFP`     | Substitution model passed to IQ-TREE. Default is to detect the best-fit model automatically                        |
+| `--bootstrap`            | `1000`    | Ultrafast bootstrap replicates (`iqtree -B`)               |
 | `--min_support`          | `20`      | Collapse branches with support at/below this value (%)     |
 | `--astral_jar`           | `null`    | Path to `astral.jar`; otherwise the `astral` executable on `$PATH` is used |
 
 ## Requirements
 
-Singularity is enabled by default, with automatic bind mounts. Before running,
-replace every placeholder URL in [conf/containers.config](conf/containers.config)
-with your built image URL or an absolute local SIF path. All processes have an
-explicit container entry; placeholders deliberately use the non-resolving
-`containers.example.invalid` domain.
+Singularity is enabled by default, with automatic bind mounts. 
 
-Each image must provide the tools used by its process:
-
-| Processes | Required tools |
-|-----------|----------------|
-| `INDEX_REFERENCE`, `CRAM2BAM`, `EXTRACT_WINDOW_SEQ`, `EXTRACT_REF_WINDOW` | samtools (plus gzip for reference decompression) |
-| `INDEX_VCF` | bcftools, bgzip |
-| `IDENTIFY_ALIGNMENT` | samtools, Python 3 |
-| `VALIDATE_VCF_SAMPLES` | bcftools, Python 3 |
-| `CONSENSUS` | bcftools, samtools |
-| `MAKE_WINDOWS`, `PREPARE_MASK` | bedtools |
-| `MASK_GENOME` | bedtools, samtools, gzip |
-| `ANGSD_CONSENSUS` | ANGSD, samtools |
-| `BUILD_ALIGNMENT`, `COMBINE_TREES` | cat |
-| `FILTER_ALIGNMENT` | Python 3 |
-| `IQTREE` | iqtree2 |
-| `COLLAPSE_TREE` | nw_ed (Newick Utilities) |
-| `ASTRAL` | astral and Java (or Java with `--astral_jar`) |
-
-Images also need Bash and standard Unix utilities used in the task scripts.
-The bundled Python scripts are supplied by the pipeline, not the images.
-
-Alternatively, `-profile conda` disables Singularity and uses
-[environment.yml](environment.yml). `-profile docker` also disables Singularity;
-replace the SIF placeholders with Docker-compatible image references in a
-custom config passed using `-c`. For tools installed directly on the host,
-disable Singularity using a custom config containing `singularity.enabled = false`.
+The `EXTRACT_WINDOW_SEQ` image contains samtools and Python; the `IQTREE`
+image contains both IQ-TREE and Newick Utilities. Custom container overrides
+must provide the same combined toolsets.
 
 ## Notes / assumptions
 
-- The reference may be plain FASTA or BGZF-compressed FASTA. Compressed
-  references are indexed once, and both `.fai` and `.gzi` are staged in every
-  reference-consuming task, including optional reference-window extraction.
-- The VCF should contain per-sample genotypes (`bcftools consensus -s`).
-  Uncompressed VCFs are bgzipped and indexed automatically; already
-  bgzipped/indexed VCFs are reused as-is.
+- The reference may be plain FASTA or BGZF-compressed FASTA. An existing
+  `.fai` index next to the reference is reused; otherwise the reference is
+  indexed. Any existing `.gzi` index is staged with the reference.
+- Uncompressed VCFs are bgzipped and indexed automatically. Existing
+  `.tbi`/`.csi` indexes next to bgzipped VCFs are reused; otherwise the VCF is
+  indexed.
 - Only SNPs are expected; the pipeline does not handle indels in the
   consensus step, since `bcftools consensus` on indel-containing VCFs would
   break the fixed-coordinate concatenation used to build the pseudo-alignment.
 
 ## Tests
 
-Run sample-name validation unit tests with:
+With Nextflow, bedtools, samtools, IQ-TREE (`iqtree`), and Newick Utilities
+(`nw_ed`) on `PATH`, run the focused integration tests:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
-With Nextflow and all pipeline tools on `PATH`, also run real-tool integration
-tests on generated BAM, CRAM, and VCF fixtures:
-
-```bash
-NF_SPECIES_TREE_INTEGRATION=1 python3 -m unittest discover -s tests -v
-```
-
-These check SM-based matching despite different filenames/order, VCF sample
-selection, process routing, callable masks, shared windows and species-tree
-output, plus invalid input combinations and sample mismatches. Test data and
-Nextflow outputs are created in a temporary directory and removed afterwards.
