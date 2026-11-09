@@ -13,11 +13,7 @@ include { CRAM2BAM          } from './modules/cram2bam'
 include { IDENTIFY_ALIGNMENT } from './modules/identify_alignment'
 include { VALIDATE_VCF_SAMPLES } from './modules/validate_vcf_samples'
 include { EXTRACT_WINDOW_SEQ } from './modules/extract_window_seq'
-include { EXTRACT_REF_WINDOW } from './modules/extract_ref_window'
-include { BUILD_ALIGNMENT   } from './modules/build_alignment'
-include { FILTER_ALIGNMENT  } from './modules/filter_alignment'
 include { IQTREE            } from './modules/iqtree'
-include { COLLAPSE_TREE     } from './modules/collapse_tree'
 include { COMBINE_TREES     } from './modules/combine_trees'
 include { ASTRAL            } from './modules/astral'
 
@@ -25,8 +21,8 @@ workflow {
     main:
 
     if (!params.reference)    error "Please provide --reference <path to reference fasta>"
-    if ([params.bamfiles, params.cramfiles, params.vcf].count { it } != 1) {
-        error "Please provide exactly one of --bamfiles, --cramfiles, or --vcf"
+    if ([params.bamfiles, params.vcf].count { it } != 1) {
+        error "Please provide exactly one of --bamfiles or --vcf"
     }
     if (!params.samplesheet) error "Please provide --samplesheet <CSV with sample,mask columns> for every input mode"
     if (!(params.angsd_mode in ['random', 'majority'])) {
@@ -36,7 +32,16 @@ workflow {
         error "--consensus_mode must be iupac, 1, or 2 for VCF input"
     }
 
-    ch_reference = Channel.fromPath(params.reference, checkIfExists: true)
+    ch_reference = Channel
+        .fromPath(params.reference, checkIfExists: true)
+        .map { reference ->
+            def reference_files = [reference]
+            ['.fai', '.gzi'].each { suffix ->
+                def index = file("${reference}${suffix}")
+                if (index.exists()) reference_files << index
+            }
+            tuple(reference.name, reference_files)
+        }
     ch_sample_rows = Channel
         .fromPath(params.samplesheet, checkIfExists: true)
         .splitCsv(header: true, strip: true)
@@ -69,22 +74,22 @@ workflow {
         .map { chrom, start, end, window_id -> tuple(chrom, start, end, window_id) }
 
     // ---- per-sample consensus genome (computed once per sample) ----
-    if (params.bamfiles || params.cramfiles) {
-        def extension = params.cramfiles ? '.cram' : '.bam'
+    if (params.bamfiles) {
         ch_alignments = Channel
-            .fromPath(params.cramfiles ?: params.bamfiles, checkIfExists: true)
+            .fromPath(params.bamfiles, checkIfExists: true)
             .splitText()
             .map { line -> line.trim() }
             .filter { line -> line && !line.startsWith('#') }
             .map { alignment_path ->
-                if (!alignment_path.toLowerCase().endsWith(extension)) {
-                    error "Alignment list entry must end in ${extension}: ${alignment_path}"
+                def extension = alignment_path.toLowerCase()
+                if (!(extension.endsWith('.bam') || extension.endsWith('.cram'))) {
+                    error "Alignment list entries must end in .bam or .cram: ${alignment_path}"
                 }
                 file(alignment_path, checkIfExists: true)
             }
             .toList()
             .map { alignments ->
-                if (!alignments) error "Alignment list must contain at least one ${extension} file"
+                if (!alignments) error "Alignment list must contain at least one BAM or CRAM file"
                 if (alignments.unique(false).size() != alignments.size()) error "Alignment list contains duplicate paths"
                 alignments
             }
@@ -109,22 +114,33 @@ workflow {
                 alignments
             }
 
-        if (params.cramfiles) {
-            CRAM2BAM(ch_identified, INDEX_REFERENCE.out.fasta.first(), INDEX_REFERENCE.out.indexes.first())
-            ch_bams = CRAM2BAM.out.bam.map { sample, bam, bai -> tuple(sample, bam) }
-        } else {
-            ch_bams = ch_identified
-        }
+        ch_crams = ch_identified.filter { sample, alignment -> alignment.name.toLowerCase().endsWith('.cram') }
+        ch_bam_files = ch_identified.filter { sample, alignment -> alignment.name.toLowerCase().endsWith('.bam') }
+        CRAM2BAM(ch_crams, INDEX_REFERENCE.out.fasta.first(), INDEX_REFERENCE.out.indexes.first())
+        ch_bams = ch_bam_files.mix(
+            CRAM2BAM.out.bam.map { sample, bam, bai -> tuple(sample, bam) }
+        )
         ANGSD_CONSENSUS(ch_bams)
         ch_consensus = ANGSD_CONSENSUS.out.consensus
     } else {
-        ch_vcf = Channel.fromPath(params.vcf, checkIfExists: true)
+        ch_vcf = Channel
+            .fromPath(params.vcf, checkIfExists: true)
+            .map { vcf ->
+                def vcf_files = [vcf]
+                if (vcf.name.toLowerCase().endsWith('.gz')) {
+                    ['.tbi', '.csi'].each { suffix ->
+                        def index = file("${vcf}${suffix}")
+                        if (index.exists()) vcf_files << index
+                    }
+                }
+                tuple(vcf.name, vcf_files)
+            }
 
         INDEX_VCF(ch_vcf)
-        VALIDATE_VCF_SAMPLES(INDEX_VCF.out.vcf, INDEX_VCF.out.tbi, ch_sample_names)
+        VALIDATE_VCF_SAMPLES(INDEX_VCF.out.vcf, INDEX_VCF.out.index, ch_sample_names)
         CONSENSUS(ch_samples.map { sample, mask -> sample },
             INDEX_REFERENCE.out.fasta.first(), INDEX_REFERENCE.out.indexes.first(),
-            VALIDATE_VCF_SAMPLES.out.vcf.first(), VALIDATE_VCF_SAMPLES.out.tbi.first())
+            VALIDATE_VCF_SAMPLES.out.vcf.first(), VALIDATE_VCF_SAMPLES.out.index.first())
         ch_consensus = CONSENSUS.out.consensus
     }
 
@@ -144,32 +160,19 @@ workflow {
 
     ch_window_consensus = ch_windows.combine(ch_consensus_bundle)
 
-    EXTRACT_WINDOW_SEQ(ch_window_consensus)
-
-    ch_window_seqs = EXTRACT_WINDOW_SEQ.out.seq
-
-    if (params.include_reference) {
-        EXTRACT_REF_WINDOW(ch_windows, INDEX_REFERENCE.out.fasta.first(), INDEX_REFERENCE.out.indexes.first())
-        ch_window_seqs = ch_window_seqs.mix(EXTRACT_REF_WINDOW.out.seq)
-    }
-
-    // ---- build one pseudo-alignment per window ----
-    ch_alignment_input = ch_window_seqs
-        .groupTuple(by: 0)
-
-    BUILD_ALIGNMENT(ch_alignment_input)
-    FILTER_ALIGNMENT(BUILD_ALIGNMENT.out.alignment)
+    EXTRACT_WINDOW_SEQ(ch_window_consensus,
+        params.include_reference ? INDEX_REFERENCE.out.fasta.first() : Channel.value([]),
+        params.include_reference ? INDEX_REFERENCE.out.indexes.first() : Channel.value([]))
 
     // drop windows that no longer have enough sequences after filtering
-    ch_filtered = FILTER_ALIGNMENT.out.alignment
+    ch_filtered = EXTRACT_WINDOW_SEQ.out.alignment
         .filter { window_id, fasta -> fasta.size() > 0 }
 
     // ---- gene trees ----
     IQTREE(ch_filtered)
-    COLLAPSE_TREE(IQTREE.out.tree)
 
     // ---- species tree ----
-    COMBINE_TREES(COLLAPSE_TREE.out.tree.collect())
+    COMBINE_TREES(IQTREE.out.tree.collect())
     ASTRAL(COMBINE_TREES.out.trees)
 
     publish: 
