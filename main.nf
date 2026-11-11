@@ -10,12 +10,13 @@ include { MASK_GENOME       } from './modules/mask_genome'
 include { CONSENSUS         } from './modules/consensus'
 include { ANGSD_CONSENSUS   } from './modules/angsd_consensus'
 include { CRAM2BAM          } from './modules/cram2bam'
-include { IDENTIFY_ALIGNMENT } from './modules/identify_alignment'
+include { EXTRACT_SAMPLE_INFO } from './modules/identify_alignment'
 include { VALIDATE_VCF_SAMPLES } from './modules/validate_vcf_samples'
 include { EXTRACT_WINDOW_SEQ } from './modules/extract_window_seq'
-include { IQTREE            } from './modules/iqtree'
 include { COMBINE_TREES     } from './modules/combine_trees'
 include { ASTRAL            } from './modules/astral'
+include { SUMMARIZE_FILTERING } from './modules/summarize_filtering'
+include { SUMMARIZE_SAMPLE_SURVIVAL } from './modules/summarize_sample_retention'
 
 workflow {
     main:
@@ -95,8 +96,8 @@ workflow {
             }
             .flatMap { it }
 
-        IDENTIFY_ALIGNMENT(ch_alignments)
-        ch_identified = IDENTIFY_ALIGNMENT.out.alignment
+        EXTRACT_SAMPLE_INFO(ch_alignments)
+        ch_identified = EXTRACT_SAMPLE_INFO.out.alignment
             .map { alignment, sample_file -> tuple(sample_file.text.trim(), alignment) }
             .toList()
             .map { alignments -> [alignments] }
@@ -164,29 +165,45 @@ workflow {
         params.include_reference ? INDEX_REFERENCE.out.fasta.first() : Channel.value([]),
         params.include_reference ? INDEX_REFERENCE.out.indexes.first() : Channel.value([]))
 
-    // drop windows that no longer have enough sequences after filtering
-    ch_filtered = EXTRACT_WINDOW_SEQ.out.alignment
-        .filter { window_id, fasta -> fasta.size() > 0 }
-
-    // ---- gene trees ----
-    IQTREE(ch_filtered)
+    // Collect trees (only from alignments that passed filtering)
+    ch_trees = EXTRACT_WINDOW_SEQ.out.tree
+        .filter { window_id, tree -> tree.size() > 0 }
+        .map { window_id, tree -> tree }
 
     // ---- species tree ----
-    COMBINE_TREES(IQTREE.out.tree.collect())
+    COMBINE_TREES(ch_trees.collect())
     ASTRAL(COMBINE_TREES.out.trees)
+
+    // ---- summary files ----
+    SUMMARIZE_FILTERING(EXTRACT_WINDOW_SEQ.out.filter_summary.collect())
+
+    ch_collected_alignments = EXTRACT_WINDOW_SEQ.out.alignment
+        .filter { window_id, fasta -> fasta.size() > 0 }
+        .map { window_id, fasta -> fasta }
+        .toList()
+
+    SUMMARIZE_SAMPLE_SURVIVAL(ch_sample_names, ch_collected_alignments)
 
     publish: 
         species_tree = ASTRAL.out.tree
         locus_trees = COMBINE_TREES.out.trees
+        filtering_summary = SUMMARIZE_FILTERING.out.summary
+        sample_survival = SUMMARIZE_SAMPLE_SURVIVAL.out.summary
 
     }
 
     output {
         species_tree {
-            path "${params.name}_species_tree.nwk"
+            path "${params.name}"
         }
         locus_trees {
-            path "${params.name}_locus_trees.nwk"
+            path "${params.name}"
+        }
+        filtering_summary {
+            path "${params.name}"
+        }
+        sample_survival {
+            path "${params.name}"
         }
      }
     

@@ -53,24 +53,30 @@ def main():
                          help="minimum number of sequences required to keep the alignment")
     parser.add_argument("--min-length", type=int, default=1,
                          help="minimum alignment length required after site filtering")
+    parser.add_argument("--stats-output", required=False, help="output file for filtering statistics")
     args = parser.parse_args()
 
     records = read_fasta(args.input)
+    n_seqs_orig = len(records)
+    
     if not records:
         open(args.output, "w").close()
+        if args.stats_output:
+            with open(args.stats_output, "w") as f:
+                f.write(f"0 0 0 0\n")
         return
 
     lengths = {len(seq) for _, seq in records}
     if len(lengths) > 1:
         sys.exit(f"ERROR: sequences in {args.input} have unequal lengths: {lengths}")
     aln_len = lengths.pop()
+    n_sites_orig = aln_len
 
     # site-wise filtering
     keep_cols = []
-    n_seqs = len(records)
     for col in range(aln_len):
         n_missing = sum(1 for _, seq in records if seq[col] in MISSING_CHARS)
-        if n_missing / n_seqs <= args.max_site_missing:
+        if n_missing / n_seqs_orig <= args.max_site_missing:
             keep_cols.append(col)
 
     trimmed = [
@@ -90,12 +96,21 @@ def main():
         if frac_missing <= args.max_sample_missing:
             kept_records.append((header, seq))
 
+    n_seqs_filtered = len(kept_records)
+    n_sites_filtered = trimmed_len
+
     if len(kept_records) < args.min_samples or trimmed_len < args.min_length:
         # not enough data left to build a meaningful tree for this window
         open(args.output, "w").close()
+        if args.stats_output:
+            with open(args.stats_output, "w") as f:
+                f.write(f"{n_seqs_orig} {n_sites_orig} {n_seqs_filtered} {n_sites_filtered}\n")
         return
 
     write_fasta(kept_records, args.output)
+    if args.stats_output:
+        with open(args.stats_output, "w") as f:
+            f.write(f"{n_seqs_orig} {n_sites_orig} {n_seqs_filtered} {n_sites_filtered}\n")
 
 
 if __name__ == "__main__":
