@@ -1,4 +1,4 @@
-process IDENTIFY_ALIGNMENT {
+process EXTRACT_SAMPLE_INFO {
     tag "$alignment"
     label "small"
 
