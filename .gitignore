@@ -7,3 +7,4 @@ tests/make_windows.nf
 tests/mermaid_workflow.md
 tests/test_window_tasks.py
 tests/data/windows.genome
+CHANGES.md
