@@ -102,11 +102,12 @@ combination; CRAM files are converted to BAM before consensus generation.
 Supply **exactly one** of these two options, always with `--samplesheet` and
 `--reference`.
 
-Each list contains one file path per line, for example:
+The bam/cram list should contain one file path per line, for example:
 
 ```text
 /path/to/sampleA.bam
 /path/to/sampleB.bam
+/path/to/sampleC.cram
 ```
 
 Each path must end in `.bam` or `.cram`. Blank lines and lines beginning with
